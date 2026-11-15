@@ -121,6 +121,10 @@ struct State {
     exif_rx: mpsc::Receiver<ExifEvent>,
     exif_generation: u64,
     exif_details: Option<(PathBuf, u64, String)>,
+    /// First pages of PDFs, rendered by `pdftoppm` off the UI thread.
+    pdf_tx: mpsc::Sender<PdfPageEvent>,
+    pdf_rx: mpsc::Receiver<PdfPageEvent>,
+    pdf_generation: u64,
     /// Items a FileManager1 request asked to select once their folder is listed (at once for
     /// local folders, when `gio` answers for remote ones).
     pending_reveal: Option<file_manager1::Reveal>,
@@ -162,6 +166,13 @@ enum GioEvent {
     },
     Mounts(Vec<gio::Mount>),
     OpenFailed(String, String),
+}
+
+struct PdfPageEvent {
+    generation: u64,
+    path: PathBuf,
+    /// PNG bytes of the first page, or `None` when it couldn't be rendered.
+    png: Option<Vec<u8>>,
 }
 
 struct ExifEvent {
@@ -245,6 +256,7 @@ fn init_at(cwd: Location) -> State {
     let (device_tx, device_rx) = mpsc::channel();
     let (file_manager_tx, file_manager_rx) = mpsc::channel();
     let (exif_tx, exif_rx) = mpsc::channel();
+    let (pdf_tx, pdf_rx) = mpsc::channel();
     let mut state = State {
         cwd: cwd.clone(),
         entries: Vec::new(),
@@ -306,6 +318,9 @@ fn init_at(cwd: Location) -> State {
         exif_rx,
         exif_generation: 0,
         exif_details: None,
+        pdf_tx,
+        pdf_rx,
+        pdf_generation: 0,
         pending_reveal: None,
         reveal_scroll: None,
         reveal_properties: false,
@@ -1309,14 +1324,12 @@ fn find_system_icons() -> HashMap<IconKind, PathBuf> {
 
 fn preview_file(path: &Path, kind: FileType) -> String {
     match kind {
-        FileType::Pdf => return Command::new("pdftotext").args(["-f", "1", "-l", "1", "-layout"])
-            .arg(path).arg("-").output().ok()
-            .filter(|out| out.status.success())
-            .map(|out| String::from_utf8_lossy(&out.stdout).chars().take(5000).collect())
-            .filter(|s: &String| !s.trim().is_empty())
-            .unwrap_or_else(|| "PDF preview\n\nInstall poppler-utils to show the first page's text. Use Open to view the full document in your PDF reader.".into()),
+        // The page itself arrives from `request_pdf_page`; `pdf_text_preview` is its fallback.
+        FileType::Pdf => return "Rendering the first page…".into(),
         FileType::Image => {
-            let dims = fs::read(path).ok().and_then(|bytes| image_dimensions(&bytes));
+            let dims = fs::read(path)
+                .ok()
+                .and_then(|bytes| image_dimensions(&bytes));
             return format!(
                 "IMAGE PREVIEW\n\n{}\n\n{}\n\nImage preview · {}",
                 path.file_name().unwrap_or_default().to_string_lossy(),
@@ -1343,6 +1356,20 @@ fn preview_file(path: &Path, kind: FileType) -> String {
     fs::read_to_string(path)
         .map(|s| s.chars().take(6000).collect())
         .unwrap_or_else(|_| "This file can't be previewed as text.".into())
+}
+
+/// The first page's text, for when the page can't be rendered as an image.
+fn pdf_text_preview(path: &Path) -> String {
+    Command::new("pdftotext")
+        .args(["-f", "1", "-l", "1", "-layout"])
+        .arg(path)
+        .arg("-")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).chars().take(5000).collect())
+        .filter(|s: &String| !s.trim().is_empty())
+        .unwrap_or_else(|| "PDF preview\n\nInstall poppler-utils to show the first page. Use Open to view the full document in your PDF reader.".into())
 }
 
 /// PNG and GIF dimensions from their headers, whatever the file is named.
@@ -1884,6 +1911,7 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
     let gio_changed = drain_gio_events(s);
     let devices_changed = drain_device_events(s);
     let exif_changed = poll_exif(s);
+    let pdf_changed = poll_pdf_pages(s);
     let thumbs_changed = s
         .thumbs
         .as_mut()
@@ -1895,6 +1923,7 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
         || gio_changed
         || devices_changed
         || exif_changed
+        || pdf_changed
         || thumbs_changed
         || mime_changed
 }
@@ -1915,6 +1944,56 @@ fn request_exif(s: &mut State, path: &Path, mtime: u64) {
         });
         wake();
     });
+}
+
+/// Renders the first page of `path` in the background; `poll_pdf_pages` shows it.
+fn request_pdf_page(s: &mut State, path: &Path) {
+    s.pdf_generation = s.pdf_generation.wrapping_add(1);
+    let generation = s.pdf_generation;
+    let path = path.to_path_buf();
+    let sender = s.pdf_tx.clone();
+    std::thread::spawn(move || {
+        let png = render_pdf_page(&path);
+        let _ = sender.send(PdfPageEvent {
+            generation,
+            path,
+            png,
+        });
+        wake();
+    });
+}
+
+/// The first page as PNG, its longest side 1200 pixels (sharp in the enlarged view too).
+fn render_pdf_page(path: &Path) -> Option<Vec<u8>> {
+    Command::new("pdftoppm")
+        .args(["-png", "-f", "1", "-l", "1", "-scale-to", "1200"])
+        .arg(path)
+        .output()
+        .ok()
+        .filter(|out| out.status.success() && out.stdout.starts_with(b"\x89PNG"))
+        .map(|out| out.stdout)
+}
+
+fn poll_pdf_pages(s: &mut State) -> bool {
+    let mut changed = false;
+    while let Ok(event) = s.pdf_rx.try_recv() {
+        if event.generation != s.pdf_generation
+            || s.selected != Some(Location::Local(event.path.clone()))
+        {
+            continue;
+        }
+        match (event.png, s.image_cache.as_ref()) {
+            (Some(png), Some(cache)) => {
+                s.selected_image = Some(cache.load(png));
+                s.preview =
+                    "Click the page to enlarge it. Use Open to read the full document.".into();
+            }
+            // No renderer (or a broken file): fall back to the first page's text.
+            _ => s.preview = pdf_text_preview(&event.path),
+        }
+        changed = true;
+    }
+    changed
 }
 
 fn poll_exif(s: &mut State) -> bool {
@@ -2318,6 +2397,8 @@ fn clear_selection(s: &mut State) {
 
 fn clear_exif(s: &mut State) {
     s.exif_generation = s.exif_generation.wrapping_add(1);
+    // A page still rendering belongs to the old selection.
+    s.pdf_generation = s.pdf_generation.wrapping_add(1);
     s.exif_details = None;
 }
 
@@ -2502,6 +2583,9 @@ fn refresh_preview(s: &mut State, location: &Location) {
     } else {
         None
     };
+    if kind == FileType::Pdf {
+        request_pdf_page(s, path);
+    }
     if matches!(kind, FileType::Image | FileType::OtherImage) {
         let mtime = s
             .entries
@@ -3754,7 +3838,8 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
                             el().w_full()
                                 .key("file-preview-image")
                                 .matched("file-preview-image")
-                                .h(z(180.0))
+                                // Pages are portrait: give them room to be legible.
+                                .h(z(if kind == "PDF DOCUMENT" { 320.0 } else { 180.0 }))
                                 .radius(radius::MD)
                                 .fill(t.card)
                                 .center()
@@ -4116,6 +4201,7 @@ fn on_key(s: &mut State, event: &KeyEvent, _: &mut Tx) -> bool {
             s.preview = format!("{} items selected.", s.selected_paths.len());
             s.status = format!("{} items selected", s.selected_paths.len());
             s.selected_image = None;
+            clear_exif(s);
             true
         }
         Key::Command('c' | 'x' | 'v') if !typing && !ensure_local_cwd(s) => true,
