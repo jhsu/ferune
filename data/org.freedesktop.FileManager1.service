@@ -1,0 +1,6 @@
+# D-Bus activation for org.freedesktop.FileManager1: starts Ferune when an application asks
+# the file manager to show something and no file manager is running. Exec needs an absolute
+# path; see README.md for installing it with yours.
+[D-BUS Service]
+Name=org.freedesktop.FileManager1
+Exec=/usr/bin/ferune

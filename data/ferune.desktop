@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Ferune
+Comment=A native Rune-powered file manager
+TryExec=ferune
+Exec=ferune %U
+Terminal=false
+Categories=System;FileTools;FileManager;
+MimeType=inode/directory;
+StartupWMClass=ferune
