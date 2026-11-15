@@ -1327,7 +1327,9 @@ fn preview_file(path: &Path, kind: FileType) -> String {
         // The page itself arrives from `request_pdf_page`; `pdf_text_preview` is its fallback.
         FileType::Pdf => return "Rendering the first page…".into(),
         FileType::Image => {
-            let dims = fs::read(path).ok().and_then(|bytes| image_dimensions(&bytes));
+            let dims = fs::read(path)
+                .ok()
+                .and_then(|bytes| image_dimensions(&bytes));
             return format!(
                 "IMAGE PREVIEW\n\n{}\n\n{}\n\nImage preview · {}",
                 path.file_name().unwrap_or_default().to_string_lossy(),

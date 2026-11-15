@@ -1,0 +1,126 @@
+name: CI and release
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ferune-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify:
+    name: Format, check, test, lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install native build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            dbus-daemon \
+            libasound2-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libglib2.0-bin \
+            libudev-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            pkg-config \
+            shared-mime-info
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo check --all-targets --locked
+      - run: cargo test --locked
+      - run: cargo clippy --all-targets --locked
+
+  release:
+    name: Version, build, and publish GitHub Release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libudev-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Apply Changesets and create version commit
+        id: changesets
+        run: python3 scripts/release.py
+      - name: Build release binary
+        if: steps.changesets.outputs.released == 'true'
+        run: cargo build --release --locked
+      - name: Package Linux release
+        if: steps.changesets.outputs.released == 'true'
+        id: package
+        run: |
+          version="${{ steps.changesets.outputs.version }}"
+          package_dir="$RUNNER_TEMP/ferune-release"
+          mkdir -p "$package_dir"
+          install -Dm755 target/release/ferune "$package_dir/ferune"
+          install -Dm644 data/ferune.desktop "$package_dir/ferune.desktop"
+          install -Dm644 data/org.freedesktop.FileManager1.service \
+            "$package_dir/org.freedesktop.FileManager1.service"
+          install -Dm644 README.md "$package_dir/README.md"
+          tarball="$RUNNER_TEMP/ferune-linux-x86_64-v${version}.tar.gz"
+          tar -czf "$tarball" -C "$package_dir" .
+          (cd "$RUNNER_TEMP" && sha256sum "$(basename "$tarball")" > SHA256SUMS)
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+          echo "checksums=$RUNNER_TEMP/SHA256SUMS" >> "$GITHUB_OUTPUT"
+      - name: Push version commit and tag
+        if: steps.changesets.outputs.released == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: git push origin HEAD:main "v${{ steps.changesets.outputs.version }}"
+      - name: Create GitHub Release
+        if: steps.changesets.outputs.released == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v${{ steps.changesets.outputs.version }}"
+          gh release create "$tag" \
+            "${{ steps.package.outputs.tarball }}" \
+            "${{ steps.package.outputs.checksums }}" \
+            --title "Ferune $tag" \
+            --notes-file "${{ steps.changesets.outputs.notes }}"
